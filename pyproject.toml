@@ -24,7 +24,8 @@ jupyterlab = "^4.4.2"
 mlserver = "^1.7.0"
 mlserver-mlflow = "^1.7.0"
 mlserver-catboost = "^1.7.0"
-mlflow = "^2.22.0"
+mlflow = {extras = ["catboost"], version = "^2.22.0"}
+papermill = "^2.6.0"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"
