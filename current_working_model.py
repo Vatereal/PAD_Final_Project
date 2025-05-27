@@ -1,4 +1,4 @@
-import gc, random, psutil, pynvml, polars as pl, numpy as np, pandas as pd, optuna, mlflow, mlflow.catboost
+import gc, random, polars as pl, numpy as np, pandas as pd, optuna, mlflow, mlflow.catboost
 from pathlib import Path
 from catboost import CatBoostRegressor
 from catboost.utils import get_gpu_device_count
@@ -15,23 +15,15 @@ SEED = 42
 random.seed(SEED); np.random.seed(SEED)
 
 DATA_DIR = Path("data_sampled")
-TARGET   = "tip_amount"
-EXPERIMENT = "CatBoost_TimeSeries_Optuna"
-TRIALS, SPLITS, MAX_ITERS, EARLY_STOP = 20, 5, 10000, 100
+TARGET = "tip_amount"
+EXPERIMENT = "CatBoost_Optuna"
+TRIALS = 10
+TIMEOUT_MIN = 90
+SPLITS, MAX_ITERS, EARLY_STOP = 3, 7500, 30
 
-try: gpu_count = get_gpu_device_count()
-except: gpu_count = 0
-TASK_TYPE, DEVICES = ("GPU", "0") if gpu_count else ("CPU", None)
-
-def log_sys(p=""):
-    mlflow.log_metric(f"{p}cpu_pct", psutil.cpu_percent())
-    mlflow.log_metric(f"{p}mem_pct", psutil.virtual_memory().percent)
-    try:
-        pynvml.nvmlInit(); h = pynvml.nvmlDeviceGetHandleByIndex(0)
-        u = pynvml.nvmlDeviceGetUtilizationRates(h); m = pynvml.nvmlDeviceGetMemoryInfo(h)
-        mlflow.log_metric(f"{p}gpu_util_pct", u.gpu)
-        mlflow.log_metric(f"{p}gpu_mem_used_mb", m.used/2**20); pynvml.nvmlShutdown()
-    except: pass
+try:  gpu_cnt = get_gpu_device_count()
+except: gpu_cnt = 0
+TASK_TYPE, DEVICES = ("GPU", "0") if gpu_cnt else ("CPU", None)
 
 def prep(f: Path) -> pl.DataFrame:
     df = pl.read_parquet(f, low_memory=True)
@@ -42,15 +34,14 @@ def prep(f: Path) -> pl.DataFrame:
     pick = next((c for c in ("tpep_pickup_datetime","pickup_datetime") if c in df.columns), None)
     drop = next((c for c in ("tpep_dropoff_datetime","dropoff_datetime") if c in df.columns), None)
     if pick and drop:
-        df = (
-            df.with_columns(((pl.col(drop).cast(pl.Int64)-pl.col(pick).cast(pl.Int64))/ns)
-                            .cast(pl.Float32).alias("trip_duration_min"))
-              .with_columns([
-                  pl.col(pick).dt.month().cast(pl.Int8).alias("pickup_month"),
-                  pl.col(pick).dt.day().cast(pl.Int8).alias("pickup_day"),
-                  pl.col(pick).dt.hour().cast(pl.Int8).alias("pickup_hour"),
-                  pl.col(pick).dt.weekday().cast(pl.Int8).alias("pickup_dow")])
-              .drop([pick, drop]))
+        df = (df.with_columns(((pl.col(drop).cast(pl.Int64)-pl.col(pick).cast(pl.Int64))/ns)
+                              .cast(pl.Float32).alias("trip_duration_min"))
+                .with_columns([
+                    pl.col(pick).dt.month().cast(pl.Int8).alias("pickup_month"),
+                    pl.col(pick).dt.day().cast(pl.Int8).alias("pickup_day"),
+                    pl.col(pick).dt.hour().cast(pl.Int8).alias("pickup_hour"),
+                    pl.col(pick).dt.weekday().cast(pl.Int8).alias("pickup_dow")])
+                .drop([pick, drop]))
     else:
         df = df.with_columns([
             pl.lit(0).cast(pl.Float32).alias("trip_duration_min"),
@@ -68,6 +59,7 @@ def prep(f: Path) -> pl.DataFrame:
     if "store_and_fwd_flag" not in df.columns:
         df = df.with_columns(pl.lit("missing").cast(pl.Utf8).alias("store_and_fwd_flag"))
     df = df.with_columns(pl.col("store_and_fwd_flag").fill_null("missing").cast(pl.Categorical))
+    print(df.shape)
     return df
 
 ddf = pl.concat([prep(f) for f in sorted(DATA_DIR.glob("*.parquet"))])
@@ -84,56 +76,64 @@ mlflow.set_experiment(EXPERIMENT)
 
 if mlflow.active_run(): mlflow.end_run()
 root = mlflow.start_run(run_name="optuna_catboost", log_system_metrics=True)
-log_sys("startup_")
-mlflow.log_params({"cpu_cores": psutil.cpu_count(logical=True),
-                   "mem_total_gb": round(psutil.virtual_memory().total/2**30,2),
-                   "gpu_available": TASK_TYPE=="GPU",
-                   "task_type": TASK_TYPE})
 
 mlcb = MLflowCallback(metric_name="val_rmse", create_experiment=False, mlflow_kwargs={"nested": True})
 pruner = HyperbandPruner()
+
 @mlcb.track_in_mlflow()
-def objective(t):
-    p = {"depth": t.suggest_int("depth",4,10),
-         "learning_rate": t.suggest_float("learning_rate",1e-3,0.3,log=True),
-         "l2_leaf_reg": t.suggest_float("l2_leaf_reg",1e-3,10,log=True),
-         "subsample": t.suggest_float("subsample",0.5,1.0),
-         "min_data_in_leaf": t.suggest_int("min_data_in_leaf",1,100),
-         "bootstrap_type":"Bernoulli",
-         "iterations":MAX_ITERS,
-         "early_stopping_rounds":EARLY_STOP,
-         "eval_metric":"RMSE",
-         "random_seed":SEED,
-         "task_type":TASK_TYPE,
-         "devices":DEVICES,
-         "verbose":0,
-         "cat_features":cat_cols}
-    rms, its = [], []
+def objective(trial):
+    mlflow.set_tag("mlflow.runName", f"trial_{trial.number}")
+    params = {"depth": trial.suggest_int("depth",4,10),
+              "learning_rate": trial.suggest_float("learning_rate",1e-3,0.3,log=True),
+              "l2_leaf_reg": trial.suggest_float("l2_leaf_reg",1e-3,10,log=True),
+              "subsample": trial.suggest_float("subsample",0.5,1.0),
+              "min_data_in_leaf": trial.suggest_int("min_data_in_leaf",1,100),
+              "bootstrap_type":"Bernoulli",
+              "iterations":MAX_ITERS,
+              "early_stopping_rounds":EARLY_STOP,
+              "eval_metric":"RMSE",
+              "random_seed":SEED,
+              "task_type":TASK_TYPE,
+              "devices":DEVICES,
+              "verbose":0,
+              "cat_features":cat_cols}
+    rms, iters = [], []
     for tr, vl in tscv.split(X):
-        m = CatBoostRegressor(**p)
+        m = CatBoostRegressor(**params)
         m.fit(X.iloc[tr], y.iloc[tr], eval_set=(X.iloc[vl], y.iloc[vl]), verbose=False)
         rms.append(mean_squared_error(y.iloc[vl], m.predict(X.iloc[vl])))
-        its.append(m.get_best_iteration()); del m; gc.collect()
-    cv = float(np.mean(rms)); t.set_user_attr("best_iterations", int(np.mean(its)))
-    mlflow.log_metric("rmse_cv", cv); mlflow.log_metric("best_iterations", t.user_attrs["best_iterations"]); log_sys("trial_")
+        iters.append(m.get_best_iteration()); del m; gc.collect()
+    cv = float(np.mean(rms)); trial.set_user_attr("best_iterations", int(np.mean(iters)))
+    mlflow.log_metric("rmse_cv", cv); mlflow.log_metric("best_iterations", trial.user_attrs["best_iterations"])
     return cv
 
-study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=SEED), pruner=pruner)
-study.optimize(objective, n_trials=TRIALS, callbacks=[mlcb])
+study = optuna.create_study(study_name="CatBoostOptunaStudy",
+                            direction="minimize",
+                            sampler=optuna.samplers.TPESampler(seed=SEED),
+                            pruner=pruner)
 
-best = study.best_trial.params
-final_iter = study.best_trial.user_attrs["best_iterations"]
-final = {**best, "iterations": final_iter, "random_seed": SEED,
-         "task_type": TASK_TYPE, "devices": DEVICES, "verbose": 0,
-         "bootstrap_type":"Bernoulli", "cat_features":cat_cols}
+study.optimize(objective,
+               n_trials=TRIALS,
+               timeout=TIMEOUT_MIN*60,
+               callbacks=[mlcb],
+               show_progress_bar=True)
+
+best_params = study.best_trial.params
+final_iter  = study.best_trial.user_attrs["best_iterations"]
+final = {**best_params,
+         "iterations": final_iter,
+         "random_seed": SEED,
+         "task_type": TASK_TYPE,
+         "devices": DEVICES,
+         "verbose": 0,
+         "bootstrap_type":"Bernoulli",
+         "cat_features": cat_cols}
+
 model = CatBoostRegressor(**final).fit(X, y, verbose=False)
-
-sig = infer_signature(X.head(100), model.predict(X.head(100)))
-mlflow.log_params(final)
-mlflow.catboost.log_model(model, "model", signature=sig, input_example=X.head(5))
+signature = infer_signature(X.head(100), model.predict(X.head(100)))
+mlflow.catboost.log_model(model, "model", signature=signature, input_example=X.head(5))
 if Path("catboost_info").exists(): mlflow.log_artifacts("catboost_info", artifact_path="catboost_info")
 mlflow.log_metric("best_rmse_cv", study.best_value)
-log_sys("final_")
 mlflow.end_run()
 
 print(f"Best CV RMSE: {study.best_value:.6f}")
