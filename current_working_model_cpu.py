@@ -5,7 +5,6 @@ import numpy as np
 import pandas as pd
 import optuna, mlflow, mlflow.catboost
 from catboost import CatBoostRegressor, Pool, cv
-from catboost.utils import get_gpu_device_count
 from mlflow.models import infer_signature
 from optuna.integration.mlflow import MLflowCallback
 from optuna.pruners import HyperbandPruner
@@ -26,8 +25,7 @@ MAX_ITERS = 5_000
 EARLY_STOP = 50
 TUNE_FRACTION = 0.01
 
-gpu_cnt = get_gpu_device_count() if "get_gpu_device_count" in globals() else 0
-TASK_TYPE, DEVICES = ("GPU", "0") if gpu_cnt else ("CPU", None)
+TASK_TYPE, DEVICES = ("CPU", None)
 
 def prep(f: Path) -> pl.DataFrame:
     df = pl.read_parquet(f, low_memory=True)
@@ -85,10 +83,11 @@ X[num_cols] = X[num_cols].fillna(0).astype("float32")
 cat_idx = [X.columns.get_loc(c) for c in cat_cols]
 full_pool = Pool(X, y, cat_features=cat_idx)
 
-n_tune = int(TUNE_FRACTION * len(y))
-idx_sub = np.random.choice(len(y), n_tune, replace=False)
-X_sub, y_sub = X.iloc[idx_sub], y.iloc[idx_sub]
-tune_pool = Pool(X_sub, y_sub, cat_features=cat_idx)
+del pdf, X, y; gc.collect()
+
+n_tune = int(TUNE_FRACTION * full_pool.shape[0])
+idx_sub = np.random.choice(full_pool.shape[0], n_tune, replace=False)
+tune_pool = full_pool.slice(idx_sub)
 
 mlflow.set_experiment(EXPERIMENT)
 if mlflow.active_run(): mlflow.end_run()
@@ -110,8 +109,6 @@ def objective(trial):
         "iterations": MAX_ITERS,
         "early_stopping_rounds": EARLY_STOP,
         "task_type": TASK_TYPE,
-        "devices": DEVICES,
-        "random_seed": SEED,
         "thread_count": os.cpu_count(),
         "verbose": False
     }
@@ -138,13 +135,13 @@ study.optimize(objective, n_trials=TRIALS, timeout=TIMEOUT_MIN * 60,
 best_params = study.best_trial.params
 final_iter = study.best_trial.user_attrs["best_iterations"]
 final_params = {**best_params, "iterations": final_iter, "random_seed": SEED,
-                "task_type": TASK_TYPE, "devices": DEVICES,
+                "task_type": TASK_TYPE,
                 "thread_count": os.cpu_count(), "verbose": False,
                 "bootstrap_type": "Bernoulli"}
 
 model = CatBoostRegressor(**final_params).fit(full_pool, verbose=False)
-signature = infer_signature(X.head(100), model.predict(X.head(100)))
-mlflow.catboost.log_model(model, "model", signature=signature, input_example=X.head(5))
+signature = infer_signature(full_pool.get_features(), model.predict(full_pool.get_features()))
+mlflow.catboost.log_model(model, "model", signature=signature, input_example=full_pool.get_features()[:5])
 if Path("catboost_info").exists(): mlflow.log_artifacts("catboost_info", artifact_path="catboost_info")
 mlflow.log_metric("best_rmse_cv", study.best_value)
 mlflow.end_run()
