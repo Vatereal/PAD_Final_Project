@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore", category=optuna_w.ExperimentalWarning)
 SEED = 42
 random.seed(SEED); np.random.seed(SEED)
 
-DATA_DIR = Path("data")
+DATA_DIR = Path("data_sampled")
 TARGET = "tip_amount"
 EXPERIMENT = "YellowTaxi_Optuna"
 TRIALS = 1

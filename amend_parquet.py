@@ -18,7 +18,7 @@ def main(argv):
     p = argparse.ArgumentParser(allow_abbrev=False)
     p.add_argument("--src", default="data")
     p.add_argument("--dst", default="data_sampled")
-    p.add_argument("--frac", type=float, default=0.2)
+    p.add_argument("--frac", type=float, default=0.5)
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args(argv)
     src_dir = Path(args.src)
