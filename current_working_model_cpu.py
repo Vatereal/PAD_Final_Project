@@ -70,10 +70,10 @@ def prep(f: Path) -> pl.DataFrame:
     return df
 
 ddf = pl.concat([prep(f) for f in sorted(DATA_DIR.glob("*.parquet"))])
-pdf = ddf.to_pandas(use_pyarrow_extension_array=True); del ddf; gc.collect()
+pdf = ddf.to_pandas(use_pyarrow_extension_array=True)
 
-y = pdf[TARGET]
 X = pdf.drop(columns=[TARGET])
+y = pdf[TARGET]
 cat_cols = ["VendorID","RatecodeID","PULocationID","DOLocationID","payment_type",
             "pickup_month","pickup_day","pickup_hour","pickup_dow","store_and_fwd_flag"]
 for c in cat_cols:
@@ -81,13 +81,18 @@ for c in cat_cols:
 num_cols = X.columns.difference(cat_cols)
 X[num_cols] = X[num_cols].fillna(0).astype("float32")
 cat_idx = [X.columns.get_loc(c) for c in cat_cols]
+
 full_pool = Pool(X, y, cat_features=cat_idx)
 
-del pdf, X, y; gc.collect()
+n_tune = int(TUNE_FRACTION * len(y))
+idx_sub = np.random.choice(len(y), n_tune, replace=False)
+X_sub = X.iloc[idx_sub]
+y_sub = y.iloc[idx_sub]
 
-n_tune = int(TUNE_FRACTION * full_pool.shape[0])
-idx_sub = np.random.choice(full_pool.shape[0], n_tune, replace=False)
-tune_pool = full_pool.slice(idx_sub)
+tune_pool = Pool(X_sub, y_sub, cat_features=cat_idx)
+input_example = X_sub.head(5)
+
+del ddf, pdf, X, y; gc.collect()
 
 mlflow.set_experiment(EXPERIMENT)
 if mlflow.active_run(): mlflow.end_run()
@@ -109,6 +114,7 @@ def objective(trial):
         "iterations": MAX_ITERS,
         "early_stopping_rounds": EARLY_STOP,
         "task_type": TASK_TYPE,
+        "devices": DEVICES,
         "thread_count": os.cpu_count(),
         "verbose": False
     }
@@ -135,16 +141,16 @@ study.optimize(objective, n_trials=TRIALS, timeout=TIMEOUT_MIN * 60,
 best_params = study.best_trial.params
 final_iter = study.best_trial.user_attrs["best_iterations"]
 final_params = {**best_params, "iterations": final_iter, "random_seed": SEED,
-                "task_type": TASK_TYPE,
+                "task_type": "CPU", "devices": None,
                 "thread_count": os.cpu_count(), "verbose": False,
                 "bootstrap_type": "Bernoulli"}
 
 model = CatBoostRegressor(**final_params).fit(full_pool, verbose=False)
-signature = infer_signature(full_pool.get_features(), model.predict(full_pool.get_features()))
-mlflow.catboost.log_model(model, "model", signature=signature, input_example=full_pool.get_features()[:5])
+sample_pred = model.predict(input_example)
+signature = infer_signature(input_example, sample_pred)
+mlflow.catboost.log_model(model, "model", signature=signature, input_example=input_example)
 if Path("catboost_info").exists(): mlflow.log_artifacts("catboost_info", artifact_path="catboost_info")
 mlflow.log_metric("best_rmse_cv", study.best_value)
 mlflow.end_run()
 
-print(f"Best CV RMSE (subsampled tuning): {study.best_value: .6f}")
-print(f"Best params: {best_params}")
+print(f"{pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')} - Best CV RMSE: {study.best_value:.6f}")
