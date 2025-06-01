@@ -28,6 +28,7 @@ mlflow = {extras = ["catboost"], version = "^2.22.0"}
 papermill = "^2.6.0"
 optuna-integration = "^4.3.0"
 pynvml = "^12.0.0"
+evidently = "^0.7.6"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"
