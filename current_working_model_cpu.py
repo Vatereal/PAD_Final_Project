@@ -17,12 +17,12 @@ random.seed(SEED)
 np.random.seed(SEED)
 DATA_DIR = Path("data_sampled")
 TARGET = "tip_amount"
-EXPERIMENT = "YellowTaxi_Optuna_TenthSample"
-TRIALS = 5
+EXPERIMENT = "YellowTaxi_OneTenthSample"
+TRIALS = 3
 TIMEOUT_MIN = 1080
-SPLITS = 3
+SPLITS = 4
 MAX_ITERS = 10_000
-EARLY_STOP = 250
+EARLY_STOP = 350
 TUNE_FRACTION = 0.25
 TASK_TYPE, DEVICES = ("CPU", None)
 
@@ -92,15 +92,21 @@ pruner = HyperbandPruner()
 
 def objective(trial):
     mlflow.set_tag("mlflow.runName", f"trial_{trial.number}")
-    params = {"loss_function":"RMSE","depth":trial.suggest_int("depth",5,8),
-              "learning_rate":trial.suggest_float("learning_rate",1e-3,0.3,log=True),
-              "l2_leaf_reg":trial.suggest_float("l2_leaf_reg",1e-3,10,log=True),
-              "subsample":trial.suggest_float("subsample",0.5,1.0),
-              "min_data_in_leaf":trial.suggest_int("min_data_in_leaf",1,100),
-              "bootstrap_type":"Bernoulli","iterations":MAX_ITERS,
-              "early_stopping_rounds":EARLY_STOP,
-              "task_type":TASK_TYPE,"devices":DEVICES,
-              "thread_count":os.cpu_count(),"verbose":False}
+    params = {
+        "loss_function": "RMSE",
+        "depth": trial.suggest_int("depth", 5, 8),
+        "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
+        "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-3, 10, log=True),
+        "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+        "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 1, 100),
+        "bootstrap_type": "Bernoulli",
+        "iterations": trial.suggest_int("iterations", 1_000, MAX_ITERS, log=True),
+        "early_stopping_rounds": EARLY_STOP,
+        "task_type": TASK_TYPE,
+        "devices": DEVICES,
+        "thread_count": os.cpu_count(),
+        "verbose": False
+    }
     cvd = cv(pool=tune_pool, params=params, fold_count=SPLITS,
              partition_random_seed=SEED, early_stopping_rounds=EARLY_STOP,
              verbose=False)
@@ -118,13 +124,20 @@ study.optimize(objective, n_trials=TRIALS, timeout=TIMEOUT_MIN*60,
 tune_time = time.time() - start_tune
 print(f"Tuning time: {tune_time:.2f}s")
 
+print("Active MLflow run before final train:", mlflow.active_run())
+while mlflow.active_run():
+    mlflow.end_run()
+print("Closed nested runs. Now active_run() is:", mlflow.active_run())
+
 best = study.best_trial.params
 best_iter = study.best_trial.user_attrs["best_iterations"]
-final_params = {**best, "iterations":best_iter,"random_seed":SEED,
-                "task_type":"CPU","devices":None,
-                "thread_count":os.cpu_count(),"verbose":False,
-                "bootstrap_type":"Bernoulli"}
+print("Best iteration chosen by CV:", best_iter)
+final_params = {**best, "iterations": best_iter, "random_seed": SEED,
+                "task_type": "CPU", "devices": None,
+                "thread_count": os.cpu_count(), "verbose": False,
+                "bootstrap_type": "Bernoulli"}
 
+mlflow.start_run(run_name="final_catboost_fit", log_system_metrics=True)
 start_train = time.time()
 model = CatBoostRegressor(**final_params).fit(full_pool, verbose=False)
 train_time = time.time() - start_train
@@ -133,7 +146,7 @@ print(f"Training time: {train_time:.2f}s")
 start_log = time.time()
 sample_pred = model.predict(input_example)
 sig = infer_signature(input_example, sample_pred)
-mlflow.catboost.log_model(model,"model",signature=sig,input_example=input_example)
+mlflow.catboost.log_model(model, "model", signature=sig, input_example=input_example)
 mlflow.log_metric("best_rmse_cv", study.best_value)
 mlflow.end_run()
 log_time = time.time() - start_log
