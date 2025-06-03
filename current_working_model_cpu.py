@@ -18,9 +18,9 @@ np.random.seed(SEED)
 DATA_DIR = Path("data_sampled")
 TARGET = "tip_amount"
 EXPERIMENT = "YellowTaxi_OneTenthSample"
-TRIALS = 3
-TIMEOUT_MIN = 1080
-SPLITS = 4
+TRIALS = 15
+TIMEOUT_MIN = 108
+SPLITS = 3
 MAX_ITERS = 10_000
 EARLY_STOP = 350
 TUNE_FRACTION = 0.25
@@ -88,13 +88,13 @@ if mlflow.active_run(): mlflow.end_run()
 mlflow.start_run(run_name="optuna_catboost", log_system_metrics=True)
 start_tune = time.time()
 mlcb = MLflowCallback(metric_name="val_rmse", create_experiment=False, mlflow_kwargs={"nested": True})
-pruner = HyperbandPruner()
+pruner = HyperbandPruner(min_resource=500,  max_resource=MAX_ITERS, reduction_factor=4)
 
 def objective(trial):
     mlflow.set_tag("mlflow.runName", f"trial_{trial.number}")
     params = {
         "loss_function": "RMSE",
-        "depth": trial.suggest_int("depth", 5, 8),
+        "depth": trial.suggest_int("depth", 5, 7),
         "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
         "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-3, 10, log=True),
         "subsample": trial.suggest_float("subsample", 0.5, 1.0),
