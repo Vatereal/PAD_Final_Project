@@ -16,8 +16,8 @@ def sample_file(src: Path, dst: Path, frac: float, rng: np.random.Generator):
 
 def main(argv):
     p = argparse.ArgumentParser(allow_abbrev=False)
-    p.add_argument("--src", default="data")
-    p.add_argument("--dst", default="data_sampled")
+    p.add_argument("--src", default="data_2025")
+    p.add_argument("--dst", default="data_2025_sampled")
     p.add_argument("--frac", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args(argv)
