@@ -1,43 +1,63 @@
-import gc, os, random, warnings, time
+import gc
+import os
+import random
+import time
+import warnings
 from pathlib import Path
-import polars as pl
+
 import numpy as np
 import pandas as pd
-import optuna, mlflow, mlflow.catboost
-from catboost import CatBoostRegressor, Pool, cv
-from mlflow.models import infer_signature
+import polars as pl
+
+import matplotlib.pyplot as plt
+
+from ydata_profiling import ProfileReport
+
+import mlflow
+import mlflow.catboost
+from mlflow import MlflowClient
+from mlflow.models.signature import infer_signature
+
+import optuna
+import optuna.exceptions as optuna_w
 from optuna.integration.mlflow import MLflowCallback
 from optuna.pruners import HyperbandPruner
-import optuna.exceptions as optuna_w
 
-warnings.filterwarnings("ignore", category=optuna_w.ExperimentalWarning)
+from catboost import CatBoostRegressor, Pool, cv
+
+from evidently import DataDefinition, Dataset, Report
+from evidently.presets import DataDriftPreset
 
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
-DATA_DIR = Path("data_sampled")
+DATA_DIR = Path("data_2024_sampled")
 TARGET = "tip_amount"
-EXPERIMENT = "YellowTaxi_OneTenthSample"
-TRIALS = 15
-TIMEOUT_MIN = 108
+
+warnings.filterwarnings("ignore", category=optuna_w.ExperimentalWarning)
+
+EXPERIMENT = "YellowTaxi_10%_Sample"
+TRIALS = 3
+TIMEOUT_MIN = 1080
 SPLITS = 3
 MAX_ITERS = 10_000
 EARLY_STOP = 350
-TUNE_FRACTION = 0.25
+TUNE_FRACTION = 0.1
 TASK_TYPE, DEVICES = ("CPU", None)
+
+mlflow.set_experiment(EXPERIMENT)
 
 def prep(f):
     df = pl.read_parquet(f, low_memory=True)
-    for c in ("tpep_pickup_datetime","pickup_datetime","tpep_dropoff_datetime","dropoff_datetime"):
+    for c in ("tpep_pickup_datetime", "pickup_datetime", "tpep_dropoff_datetime", "dropoff_datetime"):
         if c in df.columns:
             df = df.with_columns(pl.col(c).cast(pl.Datetime("ns")))
     df = df.filter(pl.col(TARGET) >= 0)
-    ns = 60_000_000_000
-    pick = next((c for c in ("tpep_pickup_datetime","pickup_datetime") if c in df.columns), None)
-    drop = next((c for c in ("tpep_dropoff_datetime","dropoff_datetime") if c in df.columns), None)
+    ns = 60000000000
+    pick = next((c for c in ("tpep_pickup_datetime", "pickup_datetime") if c in df.columns), None)
+    drop = next((c for c in ("tpep_dropoff_datetime", "dropoff_datetime") if c in df.columns), None)
     if pick and drop:
-        df = (df.with_columns(((pl.col(drop).cast(pl.Int64)-pl.col(pick).cast(pl.Int64))/ns)
-                              .cast(pl.Float32).alias("trip_duration_min"))
+        df = (df.with_columns(((pl.col(drop).cast(pl.Int64) - pl.col(pick).cast(pl.Int64)) / ns).cast(pl.Float32).alias("trip_duration_min"))
                 .with_columns([
                     pl.col(pick).dt.month().cast(pl.Int8).alias("pickup_month"),
                     pl.col(pick).dt.day().cast(pl.Int8).alias("pickup_day"),
@@ -51,14 +71,12 @@ def prep(f):
             pl.lit(0).cast(pl.Int8).alias("pickup_day"),
             pl.lit(0).cast(pl.Int8).alias("pickup_hour"),
             pl.lit(0).cast(pl.Int8).alias("pickup_dow")])
-    for c,t in {"cbd_congestion_fee":pl.Float32,"airport_fee":pl.Float32,"congestion_surcharge":pl.Float32}.items():
+    for c, t in {"cbd_congestion_fee": pl.Float32, "airport_fee": pl.Float32, "congestion_surcharge": pl.Float32}.items():
         if c not in df.columns:
             df = df.with_columns(pl.lit(0).cast(t).alias(c))
-    int_cats = ["VendorID","RatecodeID","PULocationID","DOLocationID","payment_type",
-                "pickup_month","pickup_day","pickup_hour","pickup_dow"]
+    int_cats = ["VendorID", "RatecodeID", "PULocationID", "DOLocationID", "payment_type", "pickup_month", "pickup_day", "pickup_hour", "pickup_dow"]
     for c in int_cats:
-        df = df.with_columns((pl.col(c).fill_null(-1) if c in df.columns else pl.lit(-1))
-                             .cast(pl.Int32).alias(c))
+        df = df.with_columns((pl.col(c).fill_null(-1) if c in df.columns else pl.lit(-1)).cast(pl.Int32).alias(c))
     if "store_and_fwd_flag" not in df.columns:
         df = df.with_columns(pl.lit("missing").cast(pl.Utf8).alias("store_and_fwd_flag"))
     df = df.with_columns(pl.col("store_and_fwd_flag").fill_null("missing").cast(pl.Categorical))
@@ -68,8 +86,7 @@ ddf = pl.concat([prep(f) for f in sorted(DATA_DIR.glob("*.parquet"))])
 pdf = ddf.to_pandas(use_pyarrow_extension_array=True)
 X = pdf.drop(columns=[TARGET])
 y = pdf[TARGET]
-cat_cols = ["VendorID","RatecodeID","PULocationID","DOLocationID","payment_type",
-            "pickup_month","pickup_day","pickup_hour","pickup_dow","store_and_fwd_flag"]
+cat_cols = ["VendorID", "RatecodeID", "PULocationID", "DOLocationID", "payment_type", "pickup_month", "pickup_day", "pickup_hour", "pickup_dow", "store_and_fwd_flag"]
 for c in cat_cols:
     X[c] = pd.Categorical(X[c].astype("string").fillna("missing")).codes.astype("int32")
 num_cols = X.columns.difference(cat_cols)
@@ -82,16 +99,12 @@ X_sub, y_sub = X.iloc[idx], y.iloc[idx]
 tune_pool = Pool(X_sub, y_sub, cat_features=cat_idx)
 input_example = X_sub.head(5)
 
-del ddf, pdf; gc.collect()
-mlflow.set_experiment(EXPERIMENT)
-if mlflow.active_run(): mlflow.end_run()
-mlflow.start_run(run_name="optuna_catboost", log_system_metrics=True)
-start_tune = time.time()
-mlcb = MLflowCallback(metric_name="val_rmse", create_experiment=False, mlflow_kwargs={"nested": True})
-pruner = HyperbandPruner(min_resource=500,  max_resource=MAX_ITERS, reduction_factor=4)
+del ddf, pdf
+gc.collect()
+
+pruner = optuna.pruners.HyperbandPruner(min_resource=500, max_resource=MAX_ITERS, reduction_factor=4)
 
 def objective(trial):
-    mlflow.set_tag("mlflow.runName", f"trial_{trial.number}")
     params = {
         "loss_function": "RMSE",
         "depth": trial.suggest_int("depth", 5, 7),
@@ -100,55 +113,61 @@ def objective(trial):
         "subsample": trial.suggest_float("subsample", 0.5, 1.0),
         "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 1, 100),
         "bootstrap_type": "Bernoulli",
-        "iterations": trial.suggest_int("iterations", 1_000, MAX_ITERS, log=True),
+        "iterations": trial.suggest_int("iterations", 1000, MAX_ITERS, log=True),
         "early_stopping_rounds": EARLY_STOP,
         "task_type": TASK_TYPE,
         "devices": DEVICES,
         "thread_count": os.cpu_count(),
         "verbose": False
     }
-    cvd = cv(pool=tune_pool, params=params, fold_count=SPLITS,
-             partition_random_seed=SEED, early_stopping_rounds=EARLY_STOP,
-             verbose=False)
-    best_i = int(cvd["test-RMSE-mean"].idxmin())
-    best_r = float(cvd["test-RMSE-mean"].min())
-    mlflow.log_metric("rmse_cv", best_r)
-    mlflow.log_metric("best_iterations", best_i)
+    with mlflow.start_run(run_name=f"trial_{trial.number}"):
+        mlflow.set_tag("user_timezone", "Europe/Moscow")
+        mlflow.set_tag("region", "Russia")
+        mlflow.log_params(params)
+        cvd = cv(pool=tune_pool, params=params, fold_count=SPLITS, partition_random_seed=SEED, early_stopping_rounds=EARLY_STOP, verbose=False)
+        best_i = int(cvd["test-RMSE-mean"].idxmin())
+        best_r = float(cvd["test-RMSE-mean"].min())
+        mlflow.log_metric("val_rmse", best_r)
+        mlflow.log_metric("best_iterations", best_i)
     trial.set_user_attr("best_iterations", best_i)
     return best_r
 
-study = optuna.create_study(study_name="CatBoostOptunaStudy", direction="minimize",
-                            sampler=optuna.samplers.TPESampler(seed=SEED), pruner=pruner)
-study.optimize(objective, n_trials=TRIALS, timeout=TIMEOUT_MIN*60,
-               callbacks=[mlcb], show_progress_bar=True)
+study = optuna.create_study(study_name="CatBoostOptunaStudy", direction="minimize", sampler=optuna.samplers.TPESampler(seed=SEED), pruner=pruner)
+start_tune = time.time()
+study.optimize(objective, n_trials=TRIALS, timeout=TIMEOUT_MIN * 60, show_progress_bar=True)
 tune_time = time.time() - start_tune
-print(f"Tuning time: {tune_time:.2f}s")
-
-print("Active MLflow run before final train:", mlflow.active_run())
-while mlflow.active_run():
-    mlflow.end_run()
-print("Closed nested runs. Now active_run() is:", mlflow.active_run())
-
 best = study.best_trial.params
 best_iter = study.best_trial.user_attrs["best_iterations"]
-print("Best iteration chosen by CV:", best_iter)
-final_params = {**best, "iterations": best_iter, "random_seed": SEED,
-                "task_type": "CPU", "devices": None,
-                "thread_count": os.cpu_count(), "verbose": False,
-                "bootstrap_type": "Bernoulli"}
+final_params = {**best, "iterations": best_iter, "random_seed": SEED, "task_type": "CPU", "devices": None, "thread_count": os.cpu_count(), "verbose": False, "bootstrap_type": "Bernoulli"}
 
-mlflow.start_run(run_name="final_catboost_fit", log_system_metrics=True)
-start_train = time.time()
-model = CatBoostRegressor(**final_params).fit(full_pool, verbose=False)
-train_time = time.time() - start_train
+with mlflow.start_run(run_name="final_catboost_fit") as fin_run:
+    mlflow.set_tag("user_timezone", "Europe/Moscow")
+    mlflow.set_tag("region", "Russia")
+    start_train = time.time()
+    model = CatBoostRegressor(**final_params).fit(full_pool, verbose=False)
+    train_time = time.time() - start_train
+    sample_pred = model.predict(input_example)
+    sig = infer_signature(input_example, sample_pred)
+    mlflow.catboost.log_model(model, "model", signature=sig, input_example=input_example, registered_model_name="nyc_taxi_fare_catboost")
+    mlflow.log_metric("best_rmse_cv", study.best_value)
+    fi = model.get_feature_importance(type="FeatureImportance", prettified=False)
+    cols = np.array(X.columns)
+    rank = np.argsort(fi)[::-1]
+    fig, ax = plt.subplots(figsize=(8, 0.35 * len(cols)))
+    ax.barh(range(len(rank)), fi[rank][::-1])
+    ax.set_yticks(range(len(rank)))
+    ax.set_yticklabels(cols[rank][::-1])
+    ax.invert_yaxis()
+    ax.set_xlabel("Gain")
+    ax.set_title("CatBoost feature importance")
+    fig.tight_layout()
+    mlflow.log_figure(fig, "feature_importance.png")
+    plt.close(fig)
+
+client = MlflowClient()
+mv = client.get_latest_versions("nyc_taxi_fare_catboost", stages=["None"])[0]
+client.transition_model_version_stage("nyc_taxi_fare_catboost", mv.version, stage="Staging")
+
+print(f"Tuning time: {tune_time:.2f}s")
 print(f"Training time: {train_time:.2f}s")
-
-start_log = time.time()
-sample_pred = model.predict(input_example)
-sig = infer_signature(input_example, sample_pred)
-mlflow.catboost.log_model(model, "model", signature=sig, input_example=input_example)
-mlflow.log_metric("best_rmse_cv", study.best_value)
-mlflow.end_run()
-log_time = time.time() - start_log
-print(f"Logging time: {log_time:.2f}s")
-print(f"{pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')} - Total time: {tune_time+train_time+log_time:.2f}s")
+print(f"{pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')} - Total time: {tune_time + train_time:.2f}s")
